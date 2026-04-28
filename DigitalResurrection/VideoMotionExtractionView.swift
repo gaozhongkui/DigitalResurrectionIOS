@@ -116,34 +116,82 @@ struct VideoMotionExtractionView: View {
         progress = 0
         capturedMotion = []
 
-        Task.detached(priority: .userInitiated) {
-            let asset = AVAsset(url: url)
-            guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return }
-            let reader = try! AVAssetReader(asset: asset)
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        Task(priority: .userInitiated) {
+            let asset = AVURLAsset(url: url)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first else {
+                await MainActor.run {
+                    self.isProcessing = false
+                    self.statusMessage = "读取视频轨道失败"
+                }
+                return
+            }
+
+            let orientation = Self.visionOrientation(fromPreferredTransform: track.preferredTransform)
+
+            let reader: AVAssetReader
+            do {
+                reader = try AVAssetReader(asset: asset)
+            } catch {
+                await MainActor.run {
+                    self.isProcessing = false
+                    self.statusMessage = "视频解码器初始化失败"
+                }
+                return
+            }
+
+            let output = AVAssetReaderTrackOutput(
+                track: track,
+                outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            )
+            output.alwaysCopiesSampleData = false
             reader.add(output)
             reader.startReading()
 
-            var frameCount = 0
-            while let sampleBuffer = output.copyNextSampleBuffer() {
-                frameCount += 1
-                if frameCount % 2 == 0 { // 15fps 采样
-                    let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)!
-                    let request = VNDetectHumanBodyPoseRequest()
-                    let handler = VNImageRequestHandler(cvPixelBuffer: imageBuffer, options: [:])
-                    try? handler.perform([request])
+            let request = VNDetectHumanBodyPoseRequest()
+            // 兼容性：不同 iOS 版本 API 不一致，这里直接取 results?.first 即可
 
-                    if let observation = request.results?.first {
-                        let frame = self.extractBoneAngles(from: observation)
-                        await MainActor.run { self.capturedMotion.append(frame) }
-                    }
-                    await MainActor.run { self.progress = min(Double(frameCount)/300.0, 0.99) }
+            var decodedCount = 0
+            var appendedCount = 0
+
+            while let sampleBuffer = output.copyNextSampleBuffer() {
+                decodedCount += 1
+
+                // 15fps 采样（大约每 2 帧取 1 帧，具体取决于视频帧率）
+                if decodedCount % 2 != 0 { continue }
+                guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
+
+                let handler = VNImageRequestHandler(cvPixelBuffer: imageBuffer, orientation: orientation, options: [:])
+                do {
+                    try handler.perform([request])
+                } catch {
+                    continue
                 }
-                if frameCount > 300 { break }
+
+                if let observation = request.results?.first {
+                    let frame = await MainActor.run { self.extractBoneAngles(from: observation) }
+                    await MainActor.run {
+                        self.capturedMotion.append(frame)
+                        appendedCount += 1
+                    }
+                }
+
+                await MainActor.run {
+                    // 用 decodedCount 做粗略进度，避免卡在 0
+                    self.progress = min(Double(decodedCount) / 300.0, 0.99)
+                    self.statusMessage = appendedCount == 0 ? "正在识别人体姿态..." : "已提取 \(appendedCount) 帧动作"
+                }
+
+                if decodedCount >= 300 { break }
             }
+
             await MainActor.run {
                 self.isProcessing = false
-                self.showResult = true
+                if self.capturedMotion.isEmpty {
+                    self.statusMessage = "没有识别到人体（请换全身清晰视频/人物占画面更大）"
+                    self.showResult = false
+                } else {
+                    self.showResult = true
+                }
             }
         }
     }
@@ -171,6 +219,15 @@ struct VideoMotionExtractionView: View {
 
         return MotionFrame(boneAngles: angles, rootOffset: offset)
     }
+
+    // Vision 需要正确的图像朝向，否则经常识别不到人体
+    private static func visionOrientation(fromPreferredTransform t: CGAffineTransform) -> CGImagePropertyOrientation {
+        // 参考常见视频轨道 transform：旋转 0/90/180/270
+        if t.a == 0, t.b == 1.0, t.c == -1.0, t.d == 0 { return .right }   // 90°
+        if t.a == 0, t.b == -1.0, t.c == 1.0, t.d == 0 { return .left }   // 270°
+        if t.a == -1.0, t.b == 0, t.c == 0, t.d == -1.0 { return .down }  // 180°
+        return .up                                                        // 0°
+    }
 }
 
 // MARK: - SceneKit 驱动显示引擎
@@ -196,7 +253,10 @@ struct RealMotionSceneView: View {
                     }
                 }
                 Spacer()
-                Text("已提取 \(frames.count) 帧：正在真实驱动 3D 骨骼").font(.caption).foregroundColor(.white.opacity(0.5)).padding(.bottom, 30)
+                Text(frames.isEmpty ? "提取为 0 帧：请换全身清晰视频" : "已提取 \(frames.count) 帧：正在驱动骨骼（若不动请看控制台骨骼名）")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.bottom, 30)
             }
         }
     }
@@ -242,6 +302,7 @@ struct SCNMotionContainer: UIViewRepresentable {
     class Coordinator {
         var timer: Timer?
         @Binding var frameIndex: Int
+        private var didPrintDebug = false
 
         init(frameIndex: Binding<Int>) {
             self._frameIndex = frameIndex
@@ -268,15 +329,54 @@ struct SCNMotionContainer: UIViewRepresentable {
 
         private func rotateBone(_ scene: SCNScene, _ name: String, angle: Float?, offset: Float) {
             guard let angle = angle else { return }
-            // 尝试匹配多种骨骼命名
-            let possibleNames = [name, "mixamorig_" + name, name.lowercased(), name.capitalized]
+            // 尝试匹配多种骨骼命名（USDZ / Mixamo 常见风格）
+            let possibleNames = [
+                name,
+                "mixamorig_" + name,
+                "mixamorig:" + name,
+                "mixamorig-" + name,
+                name.lowercased(),
+                name.capitalized
+            ]
             for boneName in possibleNames {
                 if let boneNode = scene.rootNode.childNode(withName: boneName, recursively: true) {
-                    // 对于 2D 视频，主要影响 Z 轴旋转
                     boneNode.eulerAngles.z = angle + offset
                     return
                 }
             }
+
+            // 再兜底：模糊匹配（很多 USDZ 骨骼名会带前缀/分隔符）
+            if let boneNode = Self.findNodeFuzzy(in: scene.rootNode, token: name) {
+                boneNode.eulerAngles.z = angle + offset
+                return
+            }
+
+            // 第一次失败时输出一次调试，方便你确认骨骼命名
+            if !didPrintDebug {
+                didPrintDebug = true
+                var names: [String] = []
+                scene.rootNode.enumerateChildNodes { node, _ in
+                    if let n = node.name, !n.isEmpty { names.append(n) }
+                }
+                print("[VideoMotion] 未找到骨骼：\(name). 场景节点名样本(前 60 个)：\(Array(names.prefix(60)))")
+            }
+        }
+
+        private static func findNodeFuzzy(in root: SCNNode, token: String) -> SCNNode? {
+            let target = normalize(token)
+            var found: SCNNode?
+            root.enumerateChildNodes { node, stop in
+                guard let n = node.name, !n.isEmpty else { return }
+                if normalize(n).contains(target) {
+                    found = node
+                    stop.pointee = true
+                }
+            }
+            return found
+        }
+
+        private static func normalize(_ s: String) -> String {
+            s.lowercased().filter { $0.isLetter || $0.isNumber }
         }
     }
 }
