@@ -307,6 +307,7 @@
 				DEVELOPMENT_TEAM = 2TZZP9WGJM;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "用于 AR 动作捕捉，实时追踪人体动作";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于在星系中展示您的相册图片";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -344,6 +345,7 @@
 				DEVELOPMENT_TEAM = 2TZZP9WGJM;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "用于 AR 动作捕捉，实时追踪人体动作";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于在星系中展示您的相册图片";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
