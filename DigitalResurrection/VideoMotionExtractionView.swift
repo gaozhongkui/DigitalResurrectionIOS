@@ -5,11 +5,11 @@ import MediaPipeTasksVision
 import SceneKit
 import simd
 
-// MARK: - 动作帧数据模型 (优化版)
+// MARK: - 动作帧数据模型
 struct MotionFrame: Identifiable {
     let id = UUID()
-    // 存储关键部位的角度：[关节名 : 旋转角度]
-    var boneRotations: [String: SCNVector4] = [:]
+    // 存储关键部位的 3D 旋转 (世界坐标系下的期望方向)
+    var boneWorldOrientations: [String: simd_quatf] = [:]
     var rootOffset: SCNVector3 = SCNVector3Zero
 }
 
@@ -38,6 +38,9 @@ struct VideoMotionExtractionView: View {
     @State private var showResult = false
     @Environment(\.dismiss) var dismiss
 
+    // 平滑滤波器缓存
+    @State private var lastOrientations: [String: simd_quatf] = [:]
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 20) {
@@ -51,7 +54,7 @@ struct VideoMotionExtractionView: View {
                             .frame(height: 360).cornerRadius(12).padding(10)
                     } else {
                         VStack(spacing: 15) {
-                            Image(systemName: "video.badge.plus").font(.system(size: 60)).foregroundColor(.gray)
+                            Image(systemName: "video.badge.plus.fill").font(.system(size: 60)).foregroundColor(.gray)
                             Text("选择一段清晰的全身舞蹈视频").font(.callout).foregroundColor(.gray)
                         }
                     }
@@ -111,13 +114,14 @@ struct VideoMotionExtractionView: View {
     private func processVideoWithMediaPipe() {
         guard let url = videoURL else { return }
         isProcessing = true
-        statusMessage = "初始化 MediaPipe 引擎..."
+        statusMessage = "AI 正在识别 3D 关键点..."
         progress = 0
         capturedMotion = []
+        lastOrientations = [:]
 
         Task(priority: .userInitiated) {
             guard let modelPath = Bundle.main.path(forResource: "pose_landmarker_full", ofType: "task") else {
-                await MainActor.run { self.isProcessing = false; self.statusMessage = "未找到模型文件" }
+                await MainActor.run { self.isProcessing = false; self.statusMessage = "模型丢失" }
                 return
             }
 
@@ -125,31 +129,11 @@ struct VideoMotionExtractionView: View {
             options.baseOptions.modelAssetPath = modelPath
             options.runningMode = .video
             options.numPoses = 1
-            options.minPoseDetectionConfidence = 0.5
-            options.minPosePresenceConfidence = 0.5
-            options.minTrackingConfidence = 0.5
 
-            let poseLandmarker: PoseLandmarker
-            do {
-                poseLandmarker = try PoseLandmarker(options: options)
-            } catch {
-                await MainActor.run { self.isProcessing = false; self.statusMessage = "初始化失败" }
-                return
-            }
-
+            let poseLandmarker = try! PoseLandmarker(options: options)
             let asset = AVURLAsset(url: url)
-            guard let track = try? await asset.loadTracks(withMediaType: .video).first else {
-                await MainActor.run { self.isProcessing = false; self.statusMessage = "读取轨道失败" }
-                return
-            }
-
-            let reader: AVAssetReader
-            do {
-                reader = try AVAssetReader(asset: asset)
-            } catch {
-                await MainActor.run { self.isProcessing = false; self.statusMessage = "解码器失败" }
-                return
-            }
+            let reader = try! AVAssetReader(asset: asset)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first else { return }
 
             let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
             reader.add(output)
@@ -161,87 +145,159 @@ struct VideoMotionExtractionView: View {
 
             while let sampleBuffer = output.copyNextSampleBuffer() {
                 frameCount += 1
-                if frameCount % 2 != 0 { continue }
+                if frameCount % 2 != 0 { continue } // 15fps
 
                 guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
                 let timestampMs = Int(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds * 1000)
+                let mpImage = try! MPImage(pixelBuffer: imageBuffer)
 
-                let mpImage: MPImage
-                do {
-                    mpImage = try MPImage(pixelBuffer: imageBuffer)
-                } catch { continue }
+                if let result = try? poseLandmarker.detect(videoFrame: mpImage, timestampInMilliseconds: timestampMs),
+                   let landmarks = result.landmarks.first {
 
-                do {
-                    let result = try poseLandmarker.detect(videoFrame: mpImage, timestampInMilliseconds: timestampMs)
-                    if let landmarks = result.landmarks.first {
-                        let worldLandmarks = result.worldLandmarks.first
-                        let frame = self.calculateMotionFrame(landmarks: landmarks, worldLandmarks: worldLandmarks)
+                    let frame = self.calculateMotionFrame(landmarks: landmarks, worldLandmarks: result.worldLandmarks.first)
 
-                        await MainActor.run {
-                            self.capturedMotion.append(frame)
-                            self.progress = min(Double(timestampMs) / (totalSeconds * 1000), 0.99)
-                            self.statusMessage = "已提取 \(self.capturedMotion.count) 帧"
-                        }
+                    await MainActor.run {
+                        self.capturedMotion.append(frame)
+                        self.progress = min(Double(timestampMs) / (totalSeconds * 1000), 0.99)
+                        self.statusMessage = "已同步 \(self.capturedMotion.count) 帧"
                     }
-                } catch {
-                    print("MediaPipe Detection Error: \(error)")
                 }
-
-                if capturedMotion.count >= 450 { break }
+                if capturedMotion.count >= 900 { break }
             }
 
-            await MainActor.run {
-                self.isProcessing = false
-                self.showResult = !self.capturedMotion.isEmpty
-            }
+            await MainActor.run { self.isProcessing = false; self.showResult = !self.capturedMotion.isEmpty }
         }
     }
 
+    // MARK: - 3D 旋转计算 (修复版)
     private func calculateMotionFrame(landmarks: [NormalizedLandmark], worldLandmarks: [Landmark]?) -> MotionFrame {
-        var rotations: [String: SCNVector4] = [:]
+        var currentFrameOrientations: [String: simd_quatf] = [:]
 
-        // 统一转换为包含 (x, y, z) 的 Float 数组以进行计算
-        let points: [(x: Float, y: Float, z: Float)]
+        // 1. 轴对齐转换：MediaPipe (X+ left, Y+ up, Z+ close) -> SceneKit (X+ right, Y+ up, Z+ out)
+        // 注意 Z 轴反转，因为 MediaPipe Z 越小越近，SceneKit Z 越大越近
+        let points: [SIMD3<Float>]
         if let wl = worldLandmarks {
-            points = wl.map { (x: Float($0.x), y: Float($0.y), z: Float($0.z)) }
+            points = wl.map { SIMD3<Float>(-Float($0.x), Float($0.y), -Float($0.z)) }
         } else {
-            points = landmarks.map { (x: Float($0.x), y: Float($0.y), z: Float($0.z)) }
+            points = landmarks.map { SIMD3<Float>(0.5 - Float($0.x), 0.5 - Float($0.y), -Float($0.z)) }
         }
 
-        func getRotation(from: Int, to: Int, axis: SCNVector3) -> SCNVector4 {
-            guard from < points.count, to < points.count else { return SCNVector4(0, 0, 1, 0) }
-            let p1 = points[from]
-            let p2 = points[to]
-            let dx = p2.x - p1.x
-            let dy = p2.y - p1.y
-            let angle = atan2(dy, dx)
-            return SCNVector4(axis.x, axis.y, axis.z, angle)
+        // 2. 旋转计算器 (带平滑滤波)
+        func getOrientation(name: String, from: Int, to: Int, restDir: SIMD3<Float>) -> simd_quatf {
+            guard from < points.count, to < points.count else { return simd_quaternion(0, SIMD3<Float>(0, 0, 1)) }
+            let targetDir = normalize(points[to] - points[from])
+            let sourceDir = normalize(restDir)
+
+            let dotProduct = dot(sourceDir, targetDir)
+            var quat: simd_quatf
+            if dotProduct > 0.999 {
+                quat = simd_quaternion(0, SIMD3<Float>(0, 0, 1))
+            } else if dotProduct < -0.999 {
+                quat = simd_quaternion(Float.pi, SIMD3<Float>(0, 1, 0))
+            } else {
+                let axis = normalize(cross(sourceDir, targetDir))
+                let angle = acos(dotProduct)
+                quat = simd_quaternion(angle, axis)
+            }
+
+            // 简单的低通滤波 (Exponential Smoothing) 减少抖动
+            if let prev = lastOrientations[name] {
+                quat = simd_slerp(prev, quat, 0.4) // 0.4 为平滑因子
+            }
+            lastOrientations[name] = quat
+            return quat
         }
 
-        // 映射 MediaPipe 索引
-        rotations["LeftArm"] = getRotation(from: 11, to: 13, axis: SCNVector3(0, 0, 1))
-        rotations["LeftForeArm"] = getRotation(from: 13, to: 15, axis: SCNVector3(0, 0, 1))
-        rotations["RightArm"] = getRotation(from: 12, to: 14, axis: SCNVector3(0, 0, 1))
-        rotations["RightForeArm"] = getRotation(from: 14, to: 16, axis: SCNVector3(0, 0, 1))
-        rotations["LeftUpLeg"] = getRotation(from: 23, to: 25, axis: SCNVector3(0, 0, 1))
-        rotations["LeftLeg"] = getRotation(from: 25, to: 27, axis: SCNVector3(0, 0, 1))
-        rotations["RightUpLeg"] = getRotation(from: 24, to: 26, axis: SCNVector3(0, 0, 1))
-        rotations["RightLeg"] = getRotation(from: 26, to: 28, axis: SCNVector3(0, 0, 1))
+        // 3. 映射骨骼 (Mixamo 规范)
+        currentFrameOrientations["LeftArm"] = getOrientation(name: "LA", from: 11, to: 13, restDir: SIMD3<Float>(-1, 0, 0))
+        currentFrameOrientations["LeftForeArm"] = getOrientation(name: "LFA", from: 13, to: 15, restDir: SIMD3<Float>(-1, 0, 0))
+        currentFrameOrientations["RightArm"] = getOrientation(name: "RA", from: 12, to: 14, restDir: SIMD3<Float>(1, 0, 0))
+        currentFrameOrientations["RightForeArm"] = getOrientation(name: "RFA", from: 14, to: 16, restDir: SIMD3<Float>(1, 0, 0))
 
-        let hipL = points[23]
-        let hipR = points[24]
+        currentFrameOrientations["LeftUpLeg"] = getOrientation(name: "LUL", from: 23, to: 25, restDir: SIMD3<Float>(0, -1, 0))
+        currentFrameOrientations["LeftLeg"] = getOrientation(name: "LL", from: 25, to: 27, restDir: SIMD3<Float>(0, -1, 0))
+        currentFrameOrientations["RightUpLeg"] = getOrientation(name: "RUL", from: 24, to: 26, restDir: SIMD3<Float>(0, -1, 0))
+        currentFrameOrientations["RightLeg"] = getOrientation(name: "RL", from: 26, to: 28, restDir: SIMD3<Float>(0, -1, 0))
+
+        // 4. 重心位移
+        let hipL = landmarks[23]
+        let hipR = landmarks[24]
         let rootX = (hipL.x + hipR.x) / 2.0
         let rootY = (hipL.y + hipR.y) / 2.0
-        let rootZ = (hipL.z + hipR.z) / 2.0
 
         return MotionFrame(
-            boneRotations: rotations,
-            rootOffset: SCNVector3(-rootX, -rootY, -rootZ)
+            boneWorldOrientations: currentFrameOrientations,
+            rootOffset: SCNVector3((rootX - 0.5) * 1.5, (0.5 - rootY) * 1.5, 0)
         )
     }
 }
 
-// MARK: - SceneKit 驱动引擎
+// MARK: - SceneKit 驱动容器 (层级修复)
+
+struct SCNMotionContainer: UIViewRepresentable {
+    let modelURL: URL
+    let frames: [MotionFrame]
+    @Binding var frameIndex: Int
+
+    func makeUIView(context: Context) -> SCNView {
+        let scnView = SCNView()
+        scnView.backgroundColor = .black
+        scnView.autoenablesDefaultLighting = true
+        scnView.allowsCameraControl = true
+
+        if let scene = try? SCNScene(url: modelURL, options: nil) {
+            scene.rootNode.enumerateChildNodes { (node, _) in node.removeAllAnimations() }
+            scnView.scene = scene
+            let cameraNode = SCNNode()
+            cameraNode.camera = SCNCamera()
+            cameraNode.position = SCNVector3(0, 1.2, 3.5)
+            scene.rootNode.addChildNode(cameraNode)
+            context.coordinator.startDriving(scene: scene, frames: frames)
+        }
+        return scnView
+    }
+
+    func updateUIView(_ uiView: SCNView, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(frameIndex: $frameIndex) }
+
+    class Coordinator {
+        var timer: Timer?
+        @Binding var frameIndex: Int
+        init(frameIndex: Binding<Int>) { self._frameIndex = frameIndex }
+
+        func startDriving(scene: SCNScene, frames: [MotionFrame]) {
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { _ in
+                guard !frames.isEmpty else { return }
+                let frame = frames[self.frameIndex]
+
+                // 按骨骼层级顺序处理是非常重要的，但在本例中我们直接设置世界姿态
+                for (boneName, worldOrient) in frame.boneWorldOrientations {
+                    self.applyBoneRotation(scene, boneName, worldOrient)
+                }
+
+                self.frameIndex = (self.frameIndex + 1) % frames.count
+            }
+        }
+
+        private func applyBoneRotation(_ scene: SCNScene, _ name: String, _ worldOrient: simd_quatf) {
+            let possibleNames = [name, "mixamorig_" + name, "mixamorig:" + name]
+            for boneName in possibleNames {
+                if let boneNode = scene.rootNode.childNode(withName: boneName, recursively: true) {
+                    // 核心修复：消除层级干扰
+                    // 将计算出的“世界旋转”转换为该节点的“本地旋转”
+                    if let parent = boneNode.parent {
+                        let parentWorldRot = simd_quaternion(parent.simdWorldTransform)
+                        boneNode.simdOrientation = parentWorldRot.inverse * worldOrient
+                    } else {
+                        boneNode.simdOrientation = worldOrient
+                    }
+                    return
+                }
+            }
+        }
+    }
+}
 
 struct RealMotionSceneView: View {
     let modelURL: URL
@@ -262,63 +318,8 @@ struct RealMotionSceneView: View {
                     }
                 }
                 Spacer()
-                Text("MediaPipe 引擎驱动中：已加载 \(frames.count) 帧")
+                Text("MediaPipe 3D 重定向已优化 (带平滑滤波)")
                     .font(.caption).foregroundColor(.white.opacity(0.6)).padding(.bottom, 30)
-            }
-        }
-    }
-}
-
-struct SCNMotionContainer: UIViewRepresentable {
-    let modelURL: URL
-    let frames: [MotionFrame]
-    @Binding var frameIndex: Int
-
-    func makeUIView(context: Context) -> SCNView {
-        let scnView = SCNView()
-        scnView.backgroundColor = .black
-        scnView.autoenablesDefaultLighting = true
-        scnView.allowsCameraControl = true
-
-        if let scene = try? SCNScene(url: modelURL, options: nil) {
-            scene.rootNode.enumerateChildNodes { (node, _) in node.removeAllAnimations() }
-            scnView.scene = scene
-            let cameraNode = SCNNode()
-            cameraNode.camera = SCNCamera()
-            cameraNode.position = SCNVector3(0, 1, 4)
-            scene.rootNode.addChildNode(cameraNode)
-            context.coordinator.startDriving(scene: scene, frames: frames)
-        }
-        return scnView
-    }
-
-    func updateUIView(_ uiView: SCNView, context: Context) {}
-    func makeCoordinator() -> Coordinator { Coordinator(frameIndex: $frameIndex) }
-
-    class Coordinator {
-        var timer: Timer?
-        @Binding var frameIndex: Int
-        init(frameIndex: Binding<Int>) { self._frameIndex = frameIndex }
-
-        func startDriving(scene: SCNScene, frames: [MotionFrame]) {
-            timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { _ in
-                guard !frames.isEmpty else { return }
-                let frame = frames[self.frameIndex]
-                for (boneName, rotation) in frame.boneRotations {
-                    self.applyRotation(scene, boneName, rotation)
-                }
-                self.frameIndex = (self.frameIndex + 1) % frames.count
-            }
-        }
-
-        private func applyRotation(_ scene: SCNScene, _ name: String, _ rotation: SCNVector4) {
-            let possibleNames = [name, "mixamorig_" + name, "mixamorig:" + name]
-            for boneName in possibleNames {
-                if let boneNode = scene.rootNode.childNode(withName: boneName, recursively: true) {
-                    boneNode.rotation = rotation
-                    return
-                }
             }
         }
     }
