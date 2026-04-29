@@ -169,70 +169,97 @@ struct VideoMotionExtractionView: View {
         }
     }
 
-    // MARK: - 3D 旋转计算 (修复版)
+    // MARK: - 3D 旋转计算
     private func calculateMotionFrame(landmarks: [NormalizedLandmark], worldLandmarks: [Landmark]?) -> MotionFrame {
         var currentFrameOrientations: [String: simd_quatf] = [:]
 
-        // 1. 轴对齐转换：MediaPipe (X+ left, Y+ up, Z+ close) -> SceneKit (X+ right, Y+ up, Z+ out)
-        // 注意 Z 轴反转，因为 MediaPipe Z 越小越近，SceneKit Z 越大越近
+        // 坐标系对齐（基于实际骨骼调试数据确认）：
+        // MediaPipe World: X+ = 人体右侧, Y+ = 上, Z+ = 朝摄像头
+        // SceneKit 模型（面朝摄像头）: 左臂在 +X, 右臂在 -X
+        // 即 MediaPipe X 与 SceneKit X 方向相反，必须取反 X
+        // Z 方向：两者都是朝向观察者为正，不取反
         let points: [SIMD3<Float>]
         if let wl = worldLandmarks {
-            points = wl.map { SIMD3<Float>(-Float($0.x), Float($0.y), -Float($0.z)) }
+            points = wl.map { SIMD3<Float>(-Float($0.x), Float($0.y), Float($0.z)) }
         } else {
+            // 归一化坐标：图像 X 从左到右，人面向摄像头时人体右侧在图像左侧
+            // 0.5-x 等价于居中后取反，与 world landmarks 的 -x 逻辑一致
             points = landmarks.map { SIMD3<Float>(0.5 - Float($0.x), 0.5 - Float($0.y), -Float($0.z)) }
         }
 
-        // 2. 旋转计算器 (带平滑滤波)
+        // 旋转计算（带边界保护 + 低通平滑）
         func getOrientation(name: String, from: Int, to: Int, restDir: SIMD3<Float>) -> simd_quatf {
-            guard from < points.count, to < points.count else { return simd_quaternion(0, SIMD3<Float>(0, 0, 1)) }
-            let targetDir = normalize(points[to] - points[from])
+            guard from < points.count, to < points.count else {
+                return lastOrientations[name] ?? simd_quaternion(0, SIMD3<Float>(0, 0, 1))
+            }
+            let diff = points[to] - points[from]
+            let len = simd_length(diff)
+            guard len > 1e-6 else {
+                return lastOrientations[name] ?? simd_quaternion(0, SIMD3<Float>(0, 0, 1))
+            }
+            let targetDir = diff / len
             let sourceDir = normalize(restDir)
+            let dotProduct = simd_clamp(dot(sourceDir, targetDir), -1.0, 1.0)
 
-            let dotProduct = dot(sourceDir, targetDir)
             var quat: simd_quatf
-            if dotProduct > 0.999 {
+            if dotProduct > 0.9999 {
                 quat = simd_quaternion(0, SIMD3<Float>(0, 0, 1))
-            } else if dotProduct < -0.999 {
+            } else if dotProduct < -0.9999 {
                 quat = simd_quaternion(Float.pi, SIMD3<Float>(0, 1, 0))
             } else {
                 let axis = normalize(cross(sourceDir, targetDir))
-                let angle = acos(dotProduct)
-                quat = simd_quaternion(angle, axis)
+                quat = simd_quaternion(acos(dotProduct), axis)
             }
 
-            // 简单的低通滤波 (Exponential Smoothing) 减少抖动
             if let prev = lastOrientations[name] {
-                quat = simd_slerp(prev, quat, 0.4) // 0.4 为平滑因子
+                quat = simd_slerp(prev, quat, 0.4)
             }
             lastOrientations[name] = quat
             return quat
         }
 
-        // 3. 映射骨骼 (Mixamo 规范)
-        currentFrameOrientations["LeftArm"] = getOrientation(name: "LA", from: 11, to: 13, restDir: SIMD3<Float>(-1, 0, 0))
-        currentFrameOrientations["LeftForeArm"] = getOrientation(name: "LFA", from: 13, to: 15, restDir: SIMD3<Float>(-1, 0, 0))
-        currentFrameOrientations["RightArm"] = getOrientation(name: "RA", from: 12, to: 14, restDir: SIMD3<Float>(1, 0, 0))
-        currentFrameOrientations["RightForeArm"] = getOrientation(name: "RFA", from: 14, to: 16, restDir: SIMD3<Float>(1, 0, 0))
+        // restDir 来自调试数据中 T-Pose 骨骼的实际世界方向（取反 X 后）
+        // LeftArm:    (21.98→46.33, 127.78→123.22) → 取反X后 normalized ≈ (0.98, -0.18, 0)
+        // RightArm:   (-21.98→-46.33) → 取反X后 ≈ (-0.98, -0.18, 0)
+        // LeftUpLeg:  (10.33→16.49, 86.94→47.47) normalized ≈ (0.154, -0.985, -0.08)
+        // 用精确 restDir 消除骨骼对齐误差
+        let lArmRest  = normalize(SIMD3<Float>(0.98, -0.18, 0))
+        let rArmRest  = normalize(SIMD3<Float>(-0.98, -0.18, 0))
+        let lLegRest  = normalize(SIMD3<Float>(0.154, -0.985, -0.08))
+        let rLegRest  = normalize(SIMD3<Float>(-0.154, -0.985, 0.083))
 
-        currentFrameOrientations["LeftUpLeg"] = getOrientation(name: "LUL", from: 23, to: 25, restDir: SIMD3<Float>(0, -1, 0))
-        currentFrameOrientations["LeftLeg"] = getOrientation(name: "LL", from: 25, to: 27, restDir: SIMD3<Float>(0, -1, 0))
-        currentFrameOrientations["RightUpLeg"] = getOrientation(name: "RUL", from: 24, to: 26, restDir: SIMD3<Float>(0, -1, 0))
-        currentFrameOrientations["RightLeg"] = getOrientation(name: "RL", from: 26, to: 28, restDir: SIMD3<Float>(0, -1, 0))
+        currentFrameOrientations["LeftArm"]     = getOrientation(name: "LA",  from: 11, to: 13, restDir: lArmRest)
+        currentFrameOrientations["LeftForeArm"] = getOrientation(name: "LFA", from: 13, to: 15, restDir: lArmRest)
+        currentFrameOrientations["RightArm"]     = getOrientation(name: "RA",  from: 12, to: 14, restDir: rArmRest)
+        currentFrameOrientations["RightForeArm"] = getOrientation(name: "RFA", from: 14, to: 16, restDir: rArmRest)
 
-        // 4. 重心位移
-        let hipL = landmarks[23]
-        let hipR = landmarks[24]
-        let rootX = (hipL.x + hipR.x) / 2.0
-        let rootY = (hipL.y + hipR.y) / 2.0
+        // 腿部（用实测 T-Pose 方向）
+        currentFrameOrientations["LeftUpLeg"]  = getOrientation(name: "LUL", from: 23, to: 25, restDir: lLegRest)
+        currentFrameOrientations["LeftLeg"]    = getOrientation(name: "LL",  from: 25, to: 27, restDir: lLegRest)
+        currentFrameOrientations["RightUpLeg"] = getOrientation(name: "RUL", from: 24, to: 26, restDir: rLegRest)
+        currentFrameOrientations["RightLeg"]   = getOrientation(name: "RL",  from: 26, to: 28, restDir: rLegRest)
+
+        // 重心位移（优先用 world landmarks 的米制坐标，避免归一化坐标的畸变）
+        let rootX: Float
+        let rootY: Float
+        if let wl = worldLandmarks, wl.count > 24 {
+            rootX = (Float(wl[23].x) + Float(wl[24].x)) * 0.5
+            rootY = (Float(wl[23].y) + Float(wl[24].y)) * 0.5
+        } else if landmarks.count > 24 {
+            rootX = (Float(landmarks[23].x) + Float(landmarks[24].x)) * 0.5 - 0.5
+            rootY = 0.5 - (Float(landmarks[23].y) + Float(landmarks[24].y)) * 0.5
+        } else {
+            rootX = 0; rootY = 0
+        }
 
         return MotionFrame(
             boneWorldOrientations: currentFrameOrientations,
-            rootOffset: SCNVector3((rootX - 0.5) * 1.5, (0.5 - rootY) * 1.5, 0)
+            rootOffset: SCNVector3(rootX * 1.5, rootY * 1.5, 0)
         )
     }
 }
 
-// MARK: - SceneKit 驱动容器 (层级修复)
+// MARK: - SceneKit 驱动容器
 
 struct SCNMotionContainer: UIViewRepresentable {
     let modelURL: URL
@@ -246,7 +273,78 @@ struct SCNMotionContainer: UIViewRepresentable {
         scnView.allowsCameraControl = true
 
         if let scene = try? SCNScene(url: modelURL, options: nil) {
-            scene.rootNode.enumerateChildNodes { (node, _) in node.removeAllAnimations() }
+            // 移除所有动画
+            scene.rootNode.enumerateChildNodes { node, _ in node.removeAllAnimations() }
+
+            // ── 调试：打印所有节点名，帮助确认骨骼名称 ──
+            print("===== SCENE NODES =====")
+            scene.rootNode.enumerateChildNodes { node, _ in
+                guard let name = node.name else { return }
+                let p = node.worldPosition
+                print(String(format: "[Node] '%@'  worldPos=(%.2f, %.2f, %.2f)", name, p.x, p.y, p.z))
+            }
+            print("=======================")
+
+            // ── 调试：打印 Skeleton 父节点的世界变换，了解其是否有旋转偏移 ──
+            let skelNames = ["Skeleton", "mixamorig_Hips", "mixamorig:Hips", "Hips", "Armature"]
+            for sn in skelNames {
+                if let skelNode = scene.rootNode.childNode(withName: sn, recursively: true) {
+                    let q = skelNode.simdOrientation
+                    let wq = simd_quaternion(skelNode.simdWorldTransform)
+                    print(String(format: "[%@] localOrient ix=%.3f iy=%.3f iz=%.3f r=%.3f", sn, q.imag.x, q.imag.y, q.imag.z, q.real))
+                    print(String(format: "[%@] worldOrient ix=%.3f iy=%.3f iz=%.3f r=%.3f", sn, wq.imag.x, wq.imag.y, wq.imag.z, wq.real))
+                    break
+                }
+            }
+
+            // ── 通过 SCNSkinner 拿到真正的骨骼节点（不依赖名字）并重置为 T-Pose ──
+            var skinnerBones: [SCNNode] = []
+            scene.rootNode.enumerateChildNodes { node, _ in
+                if let skinner = node.skinner {
+                    print("[Skinner] found on '\(node.name ?? "-")' with \(skinner.bones.count) bones")
+                    for bone in skinner.bones {
+                        print("[Bone] '\(bone.name ?? "nil")'")
+                        // 清为 identity = Mixamo bind pose = T-Pose
+                        bone.simdOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+                    }
+                    skinnerBones = skinner.bones
+                }
+            }
+
+            // ── 调试：打印 Spine 骨骼在 T-Pose 重置后的变换 ──
+            let spineNames = ["Spine", "mixamorig_Spine", "mixamorig:Spine"]
+            for sn in spineNames {
+                if let spineNode = scene.rootNode.childNode(withName: sn, recursively: true) {
+                    let q = spineNode.simdOrientation
+                    let wq = simd_quaternion(spineNode.simdWorldTransform)
+                    let wp = spineNode.simdWorldTransform.columns.3
+                    print(String(format: "[Spine-TPose] localOrient ix=%.3f iy=%.3f iz=%.3f r=%.3f", q.imag.x, q.imag.y, q.imag.z, q.real))
+                    print(String(format: "[Spine-TPose] worldOrient ix=%.3f iy=%.3f iz=%.3f r=%.3f", wq.imag.x, wq.imag.y, wq.imag.z, wq.real))
+                    print(String(format: "[Spine-TPose] worldPos=(%.2f, %.2f, %.2f)", wp.x, wp.y, wp.z))
+                    if let par = spineNode.parent {
+                        let pq = simd_quaternion(par.simdWorldTransform)
+                        print(String(format: "[Spine-parent '%@'] worldOrient ix=%.3f iy=%.3f iz=%.3f r=%.3f", par.name ?? "?", pq.imag.x, pq.imag.y, pq.imag.z, pq.real))
+                    }
+                    break
+                }
+            }
+
+            // 如果没找到 skinner，退而用名字匹配
+            if skinnerBones.isEmpty {
+                print("[Warning] No skinner found, falling back to name-based reset")
+                scene.rootNode.enumerateChildNodes { node, _ in
+                    guard let name = node.name else { return }
+                    let lower = name.lowercased()
+                    let isBone = lower.contains("mixamorig") ||
+                                 lower.contains("hip") || lower.contains("spine") ||
+                                 lower.contains("arm") || lower.contains("leg") ||
+                                 lower.contains("foot") || lower.contains("hand") ||
+                                 lower.contains("shoulder") || lower.contains("knee") ||
+                                 lower.contains("neck") || lower.contains("head")
+                    if isBone { node.simdOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
+                }
+            }
+
             scnView.scene = scene
             let cameraNode = SCNNode()
             cameraNode.camera = SCNCamera()
@@ -267,27 +365,49 @@ struct SCNMotionContainer: UIViewRepresentable {
 
         func startDriving(scene: SCNScene, frames: [MotionFrame]) {
             timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { _ in
+            // 按层级顺序驱动：先驱动父骨骼，再驱动子骨骼，保证旋转叠加正确
+            // 层级从上往下驱动：Spine 先于手臂（Spine 是手臂父链的一部分）
+            let orderedBones = ["LeftArm", "LeftForeArm",
+                                "RightArm", "RightForeArm",
+                                "LeftUpLeg", "LeftLeg",
+                                "RightUpLeg", "RightLeg"]
+            // 视频抽帧 32fps ÷ 2 = 16fps，播放也用 16fps 保证时序一致
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0/16.0, repeats: true) { _ in
                 guard !frames.isEmpty else { return }
                 let frame = frames[self.frameIndex]
-
-                // 按骨骼层级顺序处理是非常重要的，但在本例中我们直接设置世界姿态
-                for (boneName, worldOrient) in frame.boneWorldOrientations {
-                    self.applyBoneRotation(scene, boneName, worldOrient)
+                for boneName in orderedBones {
+                    if let worldOrient = frame.boneWorldOrientations[boneName] {
+                        self.applyBoneRotation(scene, boneName, worldOrient)
+                    }
                 }
-
                 self.frameIndex = (self.frameIndex + 1) % frames.count
             }
+        }
+
+        // 从含 scale 的 4x4 矩阵中安全提取纯旋转四元数
+        private func extractRotation(from matrix: simd_float4x4) -> simd_quatf {
+            let c0 = SIMD3<Float>(matrix.columns.0.x, matrix.columns.0.y, matrix.columns.0.z)
+            let c1 = SIMD3<Float>(matrix.columns.1.x, matrix.columns.1.y, matrix.columns.1.z)
+            let c2 = SIMD3<Float>(matrix.columns.2.x, matrix.columns.2.y, matrix.columns.2.z)
+            let n0 = simd_length(c0) > 1e-6 ? normalize(c0) : SIMD3<Float>(1, 0, 0)
+            let n1 = simd_length(c1) > 1e-6 ? normalize(c1) : SIMD3<Float>(0, 1, 0)
+            let n2 = simd_length(c2) > 1e-6 ? normalize(c2) : SIMD3<Float>(0, 0, 1)
+            let rotMatrix = simd_float4x4(columns: (
+                SIMD4<Float>(n0.x, n0.y, n0.z, 0),
+                SIMD4<Float>(n1.x, n1.y, n1.z, 0),
+                SIMD4<Float>(n2.x, n2.y, n2.z, 0),
+                SIMD4<Float>(0, 0, 0, 1)
+            ))
+            return simd_quaternion(rotMatrix)
         }
 
         private func applyBoneRotation(_ scene: SCNScene, _ name: String, _ worldOrient: simd_quatf) {
             let possibleNames = [name, "mixamorig_" + name, "mixamorig:" + name]
             for boneName in possibleNames {
                 if let boneNode = scene.rootNode.childNode(withName: boneName, recursively: true) {
-                    // 核心修复：消除层级干扰
-                    // 将计算出的“世界旋转”转换为该节点的“本地旋转”
                     if let parent = boneNode.parent {
-                        let parentWorldRot = simd_quaternion(parent.simdWorldTransform)
+                        // 用 scale 安全的旋转提取，避免 simd_quaternion(matrix) 在 scale≠1 时出错
+                        let parentWorldRot = extractRotation(from: parent.simdWorldTransform)
                         boneNode.simdOrientation = parentWorldRot.inverse * worldOrient
                     } else {
                         boneNode.simdOrientation = worldOrient
