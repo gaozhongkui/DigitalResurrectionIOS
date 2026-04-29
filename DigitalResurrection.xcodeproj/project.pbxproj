@@ -6,8 +6,15 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		B28370B09915749BA0B3279E /* Pods_DigitalResurrection.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 253DDF507911D02B7AF46452 /* Pods_DigitalResurrection.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		0587B0E12F99EDA700481801 /* DigitalResurrection.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DigitalResurrection.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1E47EBD133786766536C6563 /* Pods-DigitalResurrection.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-DigitalResurrection.release.xcconfig"; path = "Target Support Files/Pods-DigitalResurrection/Pods-DigitalResurrection.release.xcconfig"; sourceTree = "<group>"; };
+		253DDF507911D02B7AF46452 /* Pods_DigitalResurrection.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_DigitalResurrection.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		944EB22B01511EC4D315EFDA /* Pods-DigitalResurrection.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-DigitalResurrection.debug.xcconfig"; path = "Target Support Files/Pods-DigitalResurrection/Pods-DigitalResurrection.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -23,6 +30,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B28370B09915749BA0B3279E /* Pods_DigitalResurrection.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -34,6 +42,8 @@
 			children = (
 				0587B0E32F99EDA700481801 /* DigitalResurrection */,
 				0587B0E22F99EDA700481801 /* Products */,
+				8FD1C4C284D77F1E8638F394 /* Pods */,
+				348923DFBD49F8EE1E21686B /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
@@ -45,6 +55,23 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		348923DFBD49F8EE1E21686B /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				253DDF507911D02B7AF46452 /* Pods_DigitalResurrection.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		8FD1C4C284D77F1E8638F394 /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				944EB22B01511EC4D315EFDA /* Pods-DigitalResurrection.debug.xcconfig */,
+				1E47EBD133786766536C6563 /* Pods-DigitalResurrection.release.xcconfig */,
+			);
+			path = Pods;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -52,6 +79,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 0587B0EC2F99EDA900481801 /* Build configuration list for PBXNativeTarget "DigitalResurrection" */;
 			buildPhases = (
+				C9B6841B56B49963DE632E34 /* [CP] Check Pods Manifest.lock */,
 				0587B0DD2F99EDA700481801 /* Sources */,
 				0587B0DE2F99EDA700481801 /* Frameworks */,
 				0587B0DF2F99EDA700481801 /* Resources */,
@@ -64,8 +92,6 @@
 				0587B0E32F99EDA700481801 /* DigitalResurrection */,
 			);
 			name = DigitalResurrection;
-			packageProductDependencies = (
-			);
 			productName = DigitalResurrection;
 			productReference = 0587B0E12F99EDA700481801 /* DigitalResurrection.app */;
 			productType = "com.apple.product-type.application";
@@ -113,6 +139,31 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		C9B6841B56B49963DE632E34 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-DigitalResurrection-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		0587B0DD2F99EDA700481801 /* Sources */ = {
@@ -246,13 +297,14 @@
 		};
 		0587B0ED2F99EDA900481801 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 944EB22B01511EC4D315EFDA /* Pods-DigitalResurrection.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5738CWZ4VT;
+				DEVELOPMENT_TEAM = 2TZZP9WGJM;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于在星系中展示您的相册图片";
@@ -267,7 +319,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.digital.ai.resurrection.digital;
+				PRODUCT_BUNDLE_IDENTIFIER = com.digital.ai.resurrection.digitalab;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -282,13 +334,14 @@
 		};
 		0587B0EE2F99EDA900481801 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 1E47EBD133786766536C6563 /* Pods-DigitalResurrection.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 5738CWZ4VT;
+				DEVELOPMENT_TEAM = 2TZZP9WGJM;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于在星系中展示您的相册图片";
@@ -303,7 +356,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.digital.ai.resurrection.digital;
+				PRODUCT_BUNDLE_IDENTIFIER = com.digital.ai.resurrection.digitalab;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

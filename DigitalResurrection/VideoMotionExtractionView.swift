@@ -1,15 +1,15 @@
 import SwiftUI
 import PhotosUI
 import AVKit
-import Vision
+import MediaPipeTasksVision
 import SceneKit
 import simd
 
-// MARK: - 动作帧数据模型 (SceneKit 兼容版)
+// MARK: - 动作帧数据模型 (优化版)
 struct MotionFrame: Identifiable {
     let id = UUID()
     // 存储关键部位的角度：[关节名 : 旋转角度]
-    var boneAngles: [VNHumanBodyPoseObservation.JointName: Float] = [:]
+    var boneRotations: [String: SCNVector4] = [:]
     var rootOffset: SCNVector3 = SCNVector3Zero
 }
 
@@ -75,9 +75,9 @@ struct VideoMotionExtractionView: View {
                     .onChange(of: selectedItem) { _ in loadVideo() }
 
                     Button {
-                        processVideoWithRealRetargeting()
+                        processVideoWithMediaPipe()
                     } label: {
-                        Label("AI 真实提取并同步到模型", systemImage: "figure.walk.circle.fill")
+                        Label("MediaPipe 3D 深度提取", systemImage: "figure.walk.circle.fill")
                             .font(.headline).frame(maxWidth: .infinity).padding()
                             .background(videoURL == nil || isProcessing ? Color.gray : Color.purple)
                             .foregroundColor(.white).cornerRadius(12)
@@ -108,129 +108,140 @@ struct VideoMotionExtractionView: View {
         }
     }
 
-    // MARK: - 真实动作分析逻辑
-    private func processVideoWithRealRetargeting() {
+    private func processVideoWithMediaPipe() {
         guard let url = videoURL else { return }
         isProcessing = true
-        statusMessage = "AI 正在逐帧计算 3D 旋转..."
+        statusMessage = "初始化 MediaPipe 引擎..."
         progress = 0
         capturedMotion = []
 
         Task(priority: .userInitiated) {
-            let asset = AVURLAsset(url: url)
-            guard let track = try? await asset.loadTracks(withMediaType: .video).first else {
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.statusMessage = "读取视频轨道失败"
-                }
+            guard let modelPath = Bundle.main.path(forResource: "pose_landmarker_full", ofType: "task") else {
+                await MainActor.run { self.isProcessing = false; self.statusMessage = "未找到模型文件" }
                 return
             }
 
-            let orientation = Self.visionOrientation(fromPreferredTransform: track.preferredTransform)
+            let options = PoseLandmarkerOptions()
+            options.baseOptions.modelAssetPath = modelPath
+            options.runningMode = .video
+            options.numPoses = 1
+            options.minPoseDetectionConfidence = 0.5
+            options.minPosePresenceConfidence = 0.5
+            options.minTrackingConfidence = 0.5
+
+            let poseLandmarker: PoseLandmarker
+            do {
+                poseLandmarker = try PoseLandmarker(options: options)
+            } catch {
+                await MainActor.run { self.isProcessing = false; self.statusMessage = "初始化失败" }
+                return
+            }
+
+            let asset = AVURLAsset(url: url)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first else {
+                await MainActor.run { self.isProcessing = false; self.statusMessage = "读取轨道失败" }
+                return
+            }
 
             let reader: AVAssetReader
             do {
                 reader = try AVAssetReader(asset: asset)
             } catch {
-                await MainActor.run {
-                    self.isProcessing = false
-                    self.statusMessage = "视频解码器初始化失败"
-                }
+                await MainActor.run { self.isProcessing = false; self.statusMessage = "解码器失败" }
                 return
             }
 
-            let output = AVAssetReaderTrackOutput(
-                track: track,
-                outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-            )
-            output.alwaysCopiesSampleData = false
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
             reader.add(output)
             reader.startReading()
 
-            let request = VNDetectHumanBodyPoseRequest()
-            // 兼容性：不同 iOS 版本 API 不一致，这里直接取 results?.first 即可
-
-            var decodedCount = 0
-            var appendedCount = 0
+            var frameCount = 0
+            let duration = try? await asset.load(.duration)
+            let totalSeconds = duration?.seconds ?? 1.0
 
             while let sampleBuffer = output.copyNextSampleBuffer() {
-                decodedCount += 1
+                frameCount += 1
+                if frameCount % 2 != 0 { continue }
 
-                // 15fps 采样（大约每 2 帧取 1 帧，具体取决于视频帧率）
-                if decodedCount % 2 != 0 { continue }
                 guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
+                let timestampMs = Int(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds * 1000)
 
-                let handler = VNImageRequestHandler(cvPixelBuffer: imageBuffer, orientation: orientation, options: [:])
+                let mpImage: MPImage
                 do {
-                    try handler.perform([request])
-                } catch {
-                    continue
-                }
+                    mpImage = try MPImage(pixelBuffer: imageBuffer)
+                } catch { continue }
 
-                if let observation = request.results?.first {
-                    let frame = await MainActor.run { self.extractBoneAngles(from: observation) }
-                    await MainActor.run {
-                        self.capturedMotion.append(frame)
-                        appendedCount += 1
+                do {
+                    let result = try poseLandmarker.detect(videoFrame: mpImage, timestampInMilliseconds: timestampMs)
+                    if let landmarks = result.landmarks.first {
+                        let worldLandmarks = result.worldLandmarks.first
+                        let frame = self.calculateMotionFrame(landmarks: landmarks, worldLandmarks: worldLandmarks)
+
+                        await MainActor.run {
+                            self.capturedMotion.append(frame)
+                            self.progress = min(Double(timestampMs) / (totalSeconds * 1000), 0.99)
+                            self.statusMessage = "已提取 \(self.capturedMotion.count) 帧"
+                        }
                     }
+                } catch {
+                    print("MediaPipe Detection Error: \(error)")
                 }
 
-                await MainActor.run {
-                    // 用 decodedCount 做粗略进度，避免卡在 0
-                    self.progress = min(Double(decodedCount) / 300.0, 0.99)
-                    self.statusMessage = appendedCount == 0 ? "正在识别人体姿态..." : "已提取 \(appendedCount) 帧动作"
-                }
-
-                if decodedCount >= 300 { break }
+                if capturedMotion.count >= 450 { break }
             }
 
             await MainActor.run {
                 self.isProcessing = false
-                if self.capturedMotion.isEmpty {
-                    self.statusMessage = "没有识别到人体（请换全身清晰视频/人物占画面更大）"
-                    self.showResult = false
-                } else {
-                    self.showResult = true
-                }
+                self.showResult = !self.capturedMotion.isEmpty
             }
         }
     }
 
-    private func extractBoneAngles(from observation: VNHumanBodyPoseObservation) -> MotionFrame {
-        var angles: [VNHumanBodyPoseObservation.JointName: Float] = [:]
+    private func calculateMotionFrame(landmarks: [NormalizedLandmark], worldLandmarks: [Landmark]?) -> MotionFrame {
+        var rotations: [String: SCNVector4] = [:]
 
-        func angleBetween(_ p1: VNHumanBodyPoseObservation.JointName, _ p2: VNHumanBodyPoseObservation.JointName) -> Float? {
-            guard let pt1 = try? observation.recognizedPoint(p1), pt1.confidence > 0.3,
-                  let pt2 = try? observation.recognizedPoint(p2), pt2.confidence > 0.3 else { return nil }
-            return Float(atan2(pt2.location.y - pt1.location.y, pt2.location.x - pt1.location.x))
+        // 统一转换为包含 (x, y, z) 的 Float 数组以进行计算
+        let points: [(x: Float, y: Float, z: Float)]
+        if let wl = worldLandmarks {
+            points = wl.map { (x: Float($0.x), y: Float($0.y), z: Float($0.z)) }
+        } else {
+            points = landmarks.map { (x: Float($0.x), y: Float($0.y), z: Float($0.z)) }
         }
 
-        // 提取核心关节角度
-        if let a = angleBetween(.leftShoulder, .leftElbow) { angles[.leftShoulder] = a }
-        if let a = angleBetween(.leftElbow, .leftWrist) { angles[.leftElbow] = a }
-        if let a = angleBetween(.rightShoulder, .rightElbow) { angles[.rightShoulder] = a }
-        if let a = angleBetween(.rightElbow, .rightWrist) { angles[.rightElbow] = a }
-
-        // 提取重心
-        var offset = SCNVector3Zero
-        if let root = try? observation.recognizedPoint(.root), root.confidence > 0.3 {
-            offset = SCNVector3(Float(root.location.x - 0.5) * 2.0, Float(root.location.y - 0.5) * 2.0, 0)
+        func getRotation(from: Int, to: Int, axis: SCNVector3) -> SCNVector4 {
+            guard from < points.count, to < points.count else { return SCNVector4(0, 0, 1, 0) }
+            let p1 = points[from]
+            let p2 = points[to]
+            let dx = p2.x - p1.x
+            let dy = p2.y - p1.y
+            let angle = atan2(dy, dx)
+            return SCNVector4(axis.x, axis.y, axis.z, angle)
         }
 
-        return MotionFrame(boneAngles: angles, rootOffset: offset)
-    }
+        // 映射 MediaPipe 索引
+        rotations["LeftArm"] = getRotation(from: 11, to: 13, axis: SCNVector3(0, 0, 1))
+        rotations["LeftForeArm"] = getRotation(from: 13, to: 15, axis: SCNVector3(0, 0, 1))
+        rotations["RightArm"] = getRotation(from: 12, to: 14, axis: SCNVector3(0, 0, 1))
+        rotations["RightForeArm"] = getRotation(from: 14, to: 16, axis: SCNVector3(0, 0, 1))
+        rotations["LeftUpLeg"] = getRotation(from: 23, to: 25, axis: SCNVector3(0, 0, 1))
+        rotations["LeftLeg"] = getRotation(from: 25, to: 27, axis: SCNVector3(0, 0, 1))
+        rotations["RightUpLeg"] = getRotation(from: 24, to: 26, axis: SCNVector3(0, 0, 1))
+        rotations["RightLeg"] = getRotation(from: 26, to: 28, axis: SCNVector3(0, 0, 1))
 
-    // Vision 需要正确的图像朝向，否则经常识别不到人体
-    private static func visionOrientation(fromPreferredTransform t: CGAffineTransform) -> CGImagePropertyOrientation {
-        // 参考常见视频轨道 transform：旋转 0/90/180/270
-        if t.a == 0, t.b == 1.0, t.c == -1.0, t.d == 0 { return .right }   // 90°
-        if t.a == 0, t.b == -1.0, t.c == 1.0, t.d == 0 { return .left }   // 270°
-        if t.a == -1.0, t.b == 0, t.c == 0, t.d == -1.0 { return .down }  // 180°
-        return .up                                                        // 0°
+        let hipL = points[23]
+        let hipR = points[24]
+        let rootX = (hipL.x + hipR.x) / 2.0
+        let rootY = (hipL.y + hipR.y) / 2.0
+        let rootZ = (hipL.z + hipR.z) / 2.0
+
+        return MotionFrame(
+            boneRotations: rotations,
+            rootOffset: SCNVector3(-rootX, -rootY, -rootZ)
+        )
     }
 }
 
-// MARK: - SceneKit 驱动显示引擎
+// MARK: - SceneKit 驱动引擎
 
 struct RealMotionSceneView: View {
     let modelURL: URL
@@ -241,10 +252,8 @@ struct RealMotionSceneView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
             SCNMotionContainer(modelURL: modelURL, frames: frames, frameIndex: $currentFrame)
                 .ignoresSafeArea()
-
             VStack {
                 HStack {
                     Spacer()
@@ -253,10 +262,8 @@ struct RealMotionSceneView: View {
                     }
                 }
                 Spacer()
-                Text(frames.isEmpty ? "提取为 0 帧：请换全身清晰视频" : "已提取 \(frames.count) 帧：正在驱动骨骼（若不动请看控制台骨骼名）")
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.6))
-                    .padding(.bottom, 30)
+                Text("MediaPipe 引擎驱动中：已加载 \(frames.count) 帧")
+                    .font(.caption).foregroundColor(.white.opacity(0.6)).padding(.bottom, 30)
             }
         }
     }
@@ -274,25 +281,14 @@ struct SCNMotionContainer: UIViewRepresentable {
         scnView.allowsCameraControl = true
 
         if let scene = try? SCNScene(url: modelURL, options: nil) {
-            // 1. 禁用所有内嵌动画
-            scene.rootNode.enumerateChildNodes { (node, _) in
-                node.removeAllAnimations()
-            }
-
+            scene.rootNode.enumerateChildNodes { (node, _) in node.removeAllAnimations() }
             scnView.scene = scene
-
-            // 2. 自动定位相机
-            let (mn, mx) = scene.rootNode.boundingBox
-            let radius = max(mx.x - mn.x, mx.y - mn.y)
             let cameraNode = SCNNode()
             cameraNode.camera = SCNCamera()
-            cameraNode.position = SCNVector3(0, 0, Float(radius > 0 ? radius * 2.5 : 5.0))
+            cameraNode.position = SCNVector3(0, 1, 4)
             scene.rootNode.addChildNode(cameraNode)
-
-            // 3. 启动驱动计时器
             context.coordinator.startDriving(scene: scene, frames: frames)
         }
-
         return scnView
     }
 
@@ -302,81 +298,28 @@ struct SCNMotionContainer: UIViewRepresentable {
     class Coordinator {
         var timer: Timer?
         @Binding var frameIndex: Int
-        private var didPrintDebug = false
-
-        init(frameIndex: Binding<Int>) {
-            self._frameIndex = frameIndex
-        }
+        init(frameIndex: Binding<Int>) { self._frameIndex = frameIndex }
 
         func startDriving(scene: SCNScene, frames: [MotionFrame]) {
             timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0/15.0, repeats: true) { _ in
+            timer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { _ in
                 guard !frames.isEmpty else { return }
                 let frame = frames[self.frameIndex]
-
-                // 1. 同步身体位移
-                scene.rootNode.position = frame.rootOffset
-
-                // 2. 映射骨骼旋转 (核心)
-                self.rotateBone(scene, "LeftArm", angle: frame.boneAngles[.leftShoulder], offset: .pi)
-                self.rotateBone(scene, "LeftForeArm", angle: frame.boneAngles[.leftElbow], offset: .pi)
-                self.rotateBone(scene, "RightArm", angle: frame.boneAngles[.rightShoulder], offset: 0)
-                self.rotateBone(scene, "RightForeArm", angle: frame.boneAngles[.rightElbow], offset: 0)
-
+                for (boneName, rotation) in frame.boneRotations {
+                    self.applyRotation(scene, boneName, rotation)
+                }
                 self.frameIndex = (self.frameIndex + 1) % frames.count
             }
         }
 
-        private func rotateBone(_ scene: SCNScene, _ name: String, angle: Float?, offset: Float) {
-            guard let angle = angle else { return }
-            // 尝试匹配多种骨骼命名（USDZ / Mixamo 常见风格）
-            let possibleNames = [
-                name,
-                "mixamorig_" + name,
-                "mixamorig:" + name,
-                "mixamorig-" + name,
-                name.lowercased(),
-                name.capitalized
-            ]
+        private func applyRotation(_ scene: SCNScene, _ name: String, _ rotation: SCNVector4) {
+            let possibleNames = [name, "mixamorig_" + name, "mixamorig:" + name]
             for boneName in possibleNames {
                 if let boneNode = scene.rootNode.childNode(withName: boneName, recursively: true) {
-                    boneNode.eulerAngles.z = angle + offset
+                    boneNode.rotation = rotation
                     return
                 }
             }
-
-            // 再兜底：模糊匹配（很多 USDZ 骨骼名会带前缀/分隔符）
-            if let boneNode = Self.findNodeFuzzy(in: scene.rootNode, token: name) {
-                boneNode.eulerAngles.z = angle + offset
-                return
-            }
-
-            // 第一次失败时输出一次调试，方便你确认骨骼命名
-            if !didPrintDebug {
-                didPrintDebug = true
-                var names: [String] = []
-                scene.rootNode.enumerateChildNodes { node, _ in
-                    if let n = node.name, !n.isEmpty { names.append(n) }
-                }
-                print("[VideoMotion] 未找到骨骼：\(name). 场景节点名样本(前 60 个)：\(Array(names.prefix(60)))")
-            }
-        }
-
-        private static func findNodeFuzzy(in root: SCNNode, token: String) -> SCNNode? {
-            let target = normalize(token)
-            var found: SCNNode?
-            root.enumerateChildNodes { node, stop in
-                guard let n = node.name, !n.isEmpty else { return }
-                if normalize(n).contains(target) {
-                    found = node
-                    stop.pointee = true
-                }
-            }
-            return found
-        }
-
-        private static func normalize(_ s: String) -> String {
-            s.lowercased().filter { $0.isLetter || $0.isNumber }
         }
     }
 }

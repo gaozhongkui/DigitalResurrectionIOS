@@ -5,6 +5,7 @@ xcuserdata/
 *.xccheckout
 *.moved-aside
 *.pbxuser
+build/
 
 # IDE
 .idea/
