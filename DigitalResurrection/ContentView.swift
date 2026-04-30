@@ -4,6 +4,7 @@ struct ContentView: View {
     @State private var showAniGen = false
     @State private var showMotionCapture = false
     @State private var showVideoMotion = false
+    @State private var showPoseStick = false
 
     var body: some View {
         ZStack {
@@ -63,7 +64,31 @@ struct ContentView: View {
                 }
                 .foregroundColor(.white)
 
-                // 3. 原有的 3D 生成入口
+                // 3. 姿态线条预览
+                Button {
+                    showPoseStick = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "figure.arms.open")
+                            .symbolRenderingMode(.multicolor)
+                            .font(.title2)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("姿态线条预览")
+                                .font(.headline)
+                            Text("视频姿态转 3D 火柴人")
+                                .font(.caption)
+                                .opacity(0.8)
+                        }
+                    }
+                    .padding(.vertical, 14)
+                    .padding(.horizontal, 24)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                }
+                .foregroundColor(.white)
+
+                // 4. 原有的 3D 生成入口
                 Button {
                     showAniGen = true
                 } label: {
@@ -97,6 +122,9 @@ struct ContentView: View {
         }
         .fullScreenCover(isPresented: $showVideoMotion) {
             VideoMotionExtractionView()
+        }
+        .fullScreenCover(isPresented: $showPoseStick) {
+            PoseStickFigureView()
         }
     }
 }
