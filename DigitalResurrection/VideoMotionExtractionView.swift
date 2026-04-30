@@ -232,7 +232,9 @@ struct SCNMotionContainer: UIViewRepresentable {
 
         func start(scene: SCNScene, frames: [MotionFrame]) {
             timer?.invalidate()
-            let order = ["Spine","Spine1","LeftArm","LeftForeArm",
+            // Spine1 不单独驱动——它是 Spine 的子骨骼，Spine 被驱动后 Spine1 会自然跟随。
+            // 单独驱动 Spine1 会因为使用错误的 tPoseParentRot 污染下游手臂的 pRot。
+            let order = ["Spine","LeftArm","LeftForeArm",
                          "RightArm","RightForeArm","LeftUpLeg","LeftLeg","RightUpLeg","RightLeg"]
 
             timer = Timer.scheduledTimer(withTimeInterval: 1/16.0, repeats: true) { [weak self] _ in
