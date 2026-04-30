@@ -264,7 +264,7 @@ struct StickFigureSceneView: UIViewRepresentable {
         // 相机：正前方，稍微偏上以看到全身
         let camNode = SCNNode()
         camNode.camera = SCNCamera()
-        camNode.position = SCNVector3(0, 0.2, 2.8)
+        camNode.position = SCNVector3(0, -0.2, 2.8)
         scene.rootNode.addChildNode(camNode)
         scnView.pointOfView = camNode
 
