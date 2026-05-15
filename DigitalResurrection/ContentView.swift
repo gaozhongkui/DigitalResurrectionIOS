@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var showMotionCapture = false
     @State private var showVideoMotion = false
     @State private var showPoseStick = false
+    @State private var showVideoDance = false
 
     var body: some View {
         ZStack {
@@ -40,7 +41,31 @@ struct ContentView: View {
                 }
                 .foregroundColor(.white)
 
-                // 2. 视频驱动入口 (新添加)
+                // 2. 视频抠人换舞蹈（新功能）
+                Button {
+                    showVideoDance = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "person.crop.rectangle.stack.fill")
+                            .symbolRenderingMode(.multicolor)
+                            .font(.title2)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("视频换舞蹈")
+                                .font(.headline)
+                            Text("抠出人物·换上新舞步")
+                                .font(.caption)
+                                .opacity(0.8)
+                        }
+                    }
+                    .padding(.vertical, 14)
+                    .padding(.horizontal, 24)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                }
+                .foregroundColor(.white)
+
+                // 3. 视频驱动入口
                 Button {
                     showVideoMotion = true
                 } label: {
@@ -125,6 +150,9 @@ struct ContentView: View {
         }
         .fullScreenCover(isPresented: $showPoseStick) {
             PoseStickFigureView()
+        }
+        .fullScreenCover(isPresented: $showVideoDance) {
+            VideoDanceView()
         }
     }
 }
