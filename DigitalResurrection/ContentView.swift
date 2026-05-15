@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var showVideoMotion = false
     @State private var showPoseStick = false
     @State private var showVideoDance = false
+    @State private var showFunnyWalk = false
 
     var body: some View {
         ZStack {
@@ -41,7 +42,30 @@ struct ContentView: View {
                 }
                 .foregroundColor(.white)
 
-                // 2. 视频抠人换舞蹈（新功能）
+                // 2. 搞怪走路（新功能）
+                Button {
+                    showFunnyWalk = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "figure.walk")
+                            .symbolRenderingMode(.multicolor)
+                            .font(.title2)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("搞怪走路")
+                                .font(.headline)
+                            Text("提取走路动作·夸张变形")
+                                .font(.caption)
+                                .opacity(0.8)
+                        }
+                    }
+                    .padding(.vertical, 14)
+                    .padding(.horizontal, 24)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                }
+                .foregroundColor(.white)
+
+                // 3. 视频抠人换背景
                 Button {
                     showVideoDance = true
                 } label: {
@@ -153,6 +177,9 @@ struct ContentView: View {
         }
         .fullScreenCover(isPresented: $showVideoDance) {
             VideoDanceView()
+        }
+        .fullScreenCover(isPresented: $showFunnyWalk) {
+            FunnyWalkView()
         }
     }
 }
